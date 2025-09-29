@@ -6,10 +6,15 @@ if [[ $# -lt 1 ]]; then
   exit 1
 fi
 
-if [[ -z "${GH_TOKEN:-}" ]]; then
-  echo "GH_TOKEN environment variable must be set for GitHub CLI authentication." >&2
+## Accept either GH_TOKEN or GITHUB_TOKEN (workflow provides GITHUB_TOKEN)
+if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" ]]; then
+  echo "GH_TOKEN or GITHUB_TOKEN environment variable must be set for Copilot authentication." >&2
+  echo "In GitHub Actions set 'GH_TOKEN: \\${{ secrets.GITHUB_TOKEN }}' on the step or pass GITHUB_TOKEN and this script will pick it up." >&2
   exit 1
 fi
+# Prefer GH_TOKEN but fall back to GITHUB_TOKEN
+GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+export GH_TOKEN
 
 RUN_ID="$1"
 WORKDIR=".ai-repair"
@@ -49,17 +54,37 @@ EOF
 
 echo "Requesting patch from Copilot..."
 
-PROMPT_PAYLOAD=$(python - <<'PY'
+PROMPT_PAYLOAD=$(python - <<EOF
 from pathlib import Path
 prompt = Path("${PROMPT_FILE}").read_text(encoding="utf-8")
 log = Path("${LOG_FILE}").read_text(encoding="utf-8")
 print(f"{prompt}\n\nHere is the failing pytest output to consider:\n{log}")
-PY
+EOF
 )
 
-echo "${PROMPT_PAYLOAD}" | gh copilot suggest --format markdown > "${OUTPUT_FILE}"
+COPILOT_CMD="copilot"
+if ! command -v "${COPILOT_CMD}" >/dev/null 2>&1; then
+  echo "Copilot CLI not found: expected 'copilot' in PATH. Ensure @github/copilot is installed." >&2
+  exit 4
+fi
 
-python scripts/extract_patch.py "${OUTPUT_FILE}" > "${PATCH_FILE}"
+echo "Using Copilot CLI: ${COPILOT_CMD}"
+if ! echo "${PROMPT_PAYLOAD}" | ${COPILOT_CMD} suggest > "${OUTPUT_FILE}" 2>"${WORKDIR}/copilot.err"; then
+  echo "'copilot suggest' failed, attempting fallback to 'copilot chat'..." >&2
+  if ! echo "${PROMPT_PAYLOAD}" | ${COPILOT_CMD} chat > "${OUTPUT_FILE}" 2>>"${WORKDIR}/copilot.err"; then
+    # If copilot fails due to missing auth, provide a clearer message for Actions logs
+    if grep -q "No valid GitHub CLI OAuth token detected" "${WORKDIR}/copilot.err" 2>/dev/null; then
+      echo "Copilot CLI error: no valid OAuth token detected. Ensure GH_TOKEN/GITHUB_TOKEN is exported for copilot auth." >&2
+      echo "In Actions you can pass GH_TOKEN: 'GH_TOKEN: \\${{ secrets.GITHUB_TOKEN }}' in the step env." >&2
+    fi
+    echo "Copilot CLI did not produce output. See ${WORKDIR}/copilot.err for details." >&2
+    tail -n +1 "${WORKDIR}/copilot.err" >&2 || true
+    exit 4
+  fi
+fi
+
+# Extract patch from Copilot output
+python scripts/extract_patch.py "${OUTPUT_FILE}" > "${PATCH_FILE}" || true
 
 if [[ ! -s "${PATCH_FILE}" ]]; then
   echo "Copilot did not return a usable patch." >&2
@@ -70,7 +95,13 @@ git apply "${PATCH_FILE}"
 
 git status --short
 
-git add -u
+# Only add updated files if any changes were made by the patch
+if git diff --quiet --exit-code; then
+  echo "No changes detected after applying patch. Exiting."
+  exit 0
+fi
+
+git add -A
 
 timestamp=$(date -u +"%Y-%m-%d %H:%M:%SZ")
 cat > "${PR_BODY_FILE}" <<EOF
